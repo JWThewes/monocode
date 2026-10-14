@@ -591,6 +591,7 @@ struct Slot {
     generation: u64,
     // None: not checked yet; Some(None): probe failed. Retry on a new tunnel.
     host_version: Option<Option<String>>,
+    host_version_probe: Arc<Mutex<()>>,
 }
 
 pub struct TunnelLease {
@@ -600,12 +601,36 @@ pub struct TunnelLease {
 }
 
 impl TunnelLease {
+    /// Serialize version probes without blocking tunnel lookup or invalidation.
     pub fn host_version(&self, probe: impl FnOnce() -> Option<String>) -> Option<String> {
+        let probe_lock = {
+            let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.generation != self.generation {
+                return None;
+            }
+            if let Some(cached) = &slot.host_version {
+                return cached.clone();
+            }
+            Arc::clone(&slot.host_version_probe)
+        };
+        let _probe_guard = probe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        {
+            // Another caller may have filled the cache or replaced the tunnel
+            // while this caller waited for the previous probe.
+            let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.generation != self.generation {
+                return None;
+            }
+            if let Some(cached) = &slot.host_version {
+                return cached.clone();
+            }
+        }
+        let value = probe();
         let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.generation != self.generation {
             return None;
         }
-        slot.host_version.get_or_insert_with(probe).clone()
+        slot.host_version.get_or_insert(value).clone()
     }
 }
 
@@ -627,6 +652,7 @@ impl Tunnels {
             failure: None,
             generation: 1,
             host_version: Some(host_version),
+            host_version_probe: Arc::default(),
         };
         let old = self.slots().insert(id, Arc::new(Mutex::new(slot)));
         drop(old);
@@ -786,6 +812,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn host_version_probe_leaves_the_tunnel_slot_available() {
+        let lease = TunnelLease {
+            endpoint: String::new(),
+            slot: Arc::new(Mutex::new(Slot::default())),
+            generation: 0,
+        };
+        assert_eq!(
+            lease.host_version(|| {
+                // Endpoint lookup and invalidation need this same mutex while
+                // a potentially slow SSH probe is in progress.
+                let _slot = lease
+                    .slot
+                    .try_lock()
+                    .expect("Version probing must not lock out tunnel requests");
+                Some("0.7.1".into())
+            }),
+            Some("0.7.1".into())
+        );
+    }
+
+    #[test]
+    fn concurrent_host_version_requests_share_successful_and_failed_probes() {
+        use std::sync::{atomic::AtomicUsize, Barrier};
+
+        for result in [Some("0.7.1".to_string()), None] {
+            let lease = TunnelLease {
+                endpoint: String::new(),
+                slot: Arc::new(Mutex::new(Slot::default())),
+                generation: 0,
+            };
+            let calls = AtomicUsize::new(0);
+            let start = Barrier::new(8);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            lease.host_version(|| {
+                                calls.fetch_add(1, Ordering::Relaxed);
+                                // Keep the probe in flight while the other
+                                // callers contend for the same missing value.
+                                std::thread::sleep(Duration::from_millis(20));
+                                result.clone()
+                            })
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    assert_eq!(worker.join().unwrap(), result);
+                }
+            });
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn a_probe_finishing_after_reconnect_cannot_return_or_cache_a_stale_version() {
+        for cached in [None, Some(Some("0.13.0".to_string()))] {
+            let lease = TunnelLease {
+                endpoint: String::new(),
+                slot: Arc::new(Mutex::new(Slot::default())),
+                generation: 0,
+            };
+            assert_eq!(
+                lease.host_version(|| {
+                    let mut slot = lease.slot.try_lock().unwrap();
+                    slot.generation = 1;
+                    slot.host_version = cached.clone();
+                    Some("0.7.1".into())
+                }),
+                None
+            );
+            assert_eq!(lease.slot.lock().unwrap().host_version, cached);
+            let next = TunnelLease {
+                generation: 1,
+                ..lease
+            };
+            assert_eq!(
+                next.host_version(|| {
+                    assert!(cached.is_none(), "Keep the new tunnel's cached version");
+                    Some("0.13.0".into())
+                }),
+                Some("0.13.0".into())
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn background_version_transport_uses_batch_mode_without_an_askpass_prompt() {
@@ -829,6 +943,7 @@ mod tests {
                 failure: Some((Instant::now(), "keep".into())),
                 generation,
                 host_version: None,
+                host_version_probe: Arc::default(),
             }))
         };
         let old = slot(1);
