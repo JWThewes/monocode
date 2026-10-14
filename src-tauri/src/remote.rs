@@ -354,15 +354,16 @@ pub fn remote_request(
     {
         return Err("Host identity changed. Add this machine again before continuing.".into());
     }
-    if method == "environment.describe" {
+    if method == "environment.describe" && host_version(&result).is_none() {
         if let (Some(target), Some(lease)) = (&machine.ssh, &tunnel_lease) {
             let platform = result
                 .get("platform")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            add_host_version(&mut result, || {
-                lease.host_version(|| remote_ssh::probe_host_version(target, platform.as_deref()))
-            });
+            let version = state.tunnels.host_version(&machine.id, lease, || {
+                remote_ssh::probe_host_version(target, platform.as_deref())
+            })?;
+            add_host_version(&mut result, || version);
         }
     }
     Ok(result)

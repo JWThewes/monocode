@@ -644,6 +644,33 @@ impl Tunnels {
     fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Mutex<Slot>>>> {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Only return a version while the lease still belongs to this machine's tunnel.
+    pub fn host_version(
+        &self,
+        id: &str,
+        lease: &TunnelLease,
+        probe: impl FnOnce() -> Option<String>,
+    ) -> Result<Option<String>, String> {
+        self.require_current_lease(id, lease)?;
+        let version = lease.host_version(probe);
+        self.require_current_lease(id, lease)?;
+        Ok(version)
+    }
+    fn require_current_lease(&self, id: &str, lease: &TunnelLease) -> Result<(), String> {
+        // Check the registry while holding the slot lock, but never hold the
+        // registry lock while waiting for a possibly reconnecting slot.
+        let current = lease.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if current.generation == lease.generation
+            && self
+                .slots()
+                .get(id)
+                .is_some_and(|slot| Arc::ptr_eq(slot, &lease.slot))
+        {
+            Ok(())
+        } else {
+            Err("Connection changed while checking the host version. Try again.".into())
+        }
+    }
     pub fn insert(&self, id: String, tunnel: Tunnel, host_version: Option<String>) {
         // A fresh slot never waits for a reconnect in progress; that attempt's
         // tunnel is dropped with the replaced slot.
@@ -896,6 +923,73 @@ mod tests {
                     Some("0.13.0".into())
                 }),
                 Some("0.13.0".into())
+            );
+        }
+    }
+
+    #[test]
+    fn replaced_or_removed_tunnels_reject_in_flight_host_version_results() {
+        for change in ["replace", "remove", "clear", "generation"] {
+            let tunnels = Tunnels::default();
+            let slot = Arc::new(Mutex::new(Slot::default()));
+            let replacement = Arc::new(Mutex::new(Slot {
+                // A fresh slot can have the same generation as the old lease.
+                host_version: Some(Some("0.13.0".into())),
+                ..Slot::default()
+            }));
+            let lease = TunnelLease {
+                endpoint: String::new(),
+                slot: slot.clone(),
+                generation: 0,
+            };
+            tunnels.slots().insert("host".into(), slot.clone());
+            let result = tunnels.host_version("host", &lease, || {
+                match change {
+                    "replace" => {
+                        tunnels.slots().insert("host".into(), replacement.clone());
+                    }
+                    "remove" => tunnels.remove("host"),
+                    "clear" => tunnels.clear(),
+                    "generation" => slot.lock().unwrap().generation += 1,
+                    _ => unreachable!(),
+                }
+                Some("0.7.1".into())
+            });
+            assert!(result.is_err(), "Must reject the result after {change}");
+            assert!(tunnels
+                .host_version("host", &lease, || panic!("Do not probe stale leases"))
+                .is_err());
+            if change == "replace" {
+                let current = TunnelLease {
+                    slot: replacement,
+                    ..lease
+                };
+                assert_eq!(
+                    tunnels.host_version("host", &current, || panic!("Keep the new cache")),
+                    Ok(Some("0.13.0".into()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_tunnels_keep_successful_and_failed_host_version_results() {
+        for version in [Some("0.7.1".to_string()), None] {
+            let tunnels = Tunnels::default();
+            let slot = Arc::new(Mutex::new(Slot::default()));
+            let lease = TunnelLease {
+                endpoint: String::new(),
+                slot: slot.clone(),
+                generation: 0,
+            };
+            tunnels.slots().insert("host".into(), slot);
+            assert_eq!(
+                tunnels.host_version("host", &lease, || version.clone()),
+                Ok(version.clone())
+            );
+            assert_eq!(
+                tunnels.host_version("host", &lease, || panic!("Use the cached result")),
+                Ok(version)
             );
         }
     }
