@@ -268,7 +268,7 @@ pub fn detect_platform(
         target,
         String::new(),
         job,
-        askpass,
+        Some(askpass),
         command(target, true),
         PLATFORM_PROBE,
     )?;
@@ -301,7 +301,7 @@ pub fn run_script(
             target,
             script,
             job,
-            askpass,
+            Some(askpass),
             command(target, true),
             &[
                 "powershell.exe",
@@ -324,21 +324,30 @@ fn run_script_with_command(
     askpass: &Askpass,
     command: Command,
 ) -> Result<String, String> {
-    run_remote_command(target, script, job, askpass, command, &["sh", "-l", "-s"])
+    run_remote_command(
+        target,
+        script,
+        job,
+        Some(askpass),
+        command,
+        &["sh", "-l", "-s"],
+    )
 }
 
 fn run_remote_command(
     target: &SshTarget,
     script: String,
     job: &Arc<Job>,
-    askpass: &Askpass,
+    askpass: Option<&Askpass>,
     mut command: Command,
     remote: &[&str],
 ) -> Result<String, String> {
     if job.cancelled.load(Ordering::Relaxed) {
         return Err("Connection cancelled".into());
     }
-    askpass.configure(&mut command)?;
+    if let Some(askpass) = askpass {
+        askpass.configure(&mut command)?;
+    }
     command.args(["--", &target.target]).args(remote);
     let mut child = command
         .spawn()
@@ -347,7 +356,7 @@ fn run_remote_command(
     let stderr = capture(child.stderr.take().unwrap());
     let mut stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
-    let deadline = Instant::now() + Duration::from_secs(300);
+    let deadline = Instant::now() + Duration::from_secs(if askpass.is_some() { 300 } else { 10 });
     let result = loop {
         if job.cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
             let _ = child.kill();
@@ -422,6 +431,54 @@ pub fn upgrade_script(platform: HostPlatform, port: u16) -> String {
             "$env:MONOCODE_HOST_FORCE_UPGRADE = '1'\n$env:MONOCODE_HOST_PORT = '{port}'\n{script}"
         ),
     }
+}
+
+pub fn version_script(platform: HostPlatform) -> String {
+    match platform {
+        HostPlatform::Unix => "set -eu\n\"$HOME/.monocode-host/bin/monocode-host\" --version\n".into(),
+        HostPlatform::Windows => "$ErrorActionPreference = 'Stop'\n$base = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.monocode-host'\n& (Join-Path $base 'bin/monocode-host.cmd') --version\nif ($LASTEXITCODE -ne 0) { throw 'Host version check failed.' }\n".into(),
+    }
+}
+
+pub fn parse_host_version(output: &str) -> Option<String> {
+    // SSH login shells may print a banner before the launcher's one-line answer.
+    let version = output.trim().lines().last()?.trim();
+    (!version.is_empty()
+        && version.len() <= 100
+        && version
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b".+-".contains(&c)))
+    .then(|| version.to_string())
+}
+
+/// A background descriptor check must never open a password/trust prompt or
+/// install anything. Failure leaves the version unknown, not the host offline.
+pub fn probe_host_version(target: &SshTarget, platform: Option<&str>) -> Option<String> {
+    let job = Job::new();
+    let probe = |remote: &[&str], script: String| {
+        run_remote_command(target, script, &job, None, command(target, false), remote).ok()
+    };
+    let platform = match platform {
+        Some("win32") => HostPlatform::Windows,
+        Some("linux" | "darwin") => HostPlatform::Unix,
+        _ => parse_platform(&probe(PLATFORM_PROBE, String::new())?).ok()?,
+    };
+    let script = version_script(platform);
+    let output = match platform {
+        HostPlatform::Unix => probe(&["sh", "-l", "-s"], script)?,
+        HostPlatform::Windows => probe(
+            &[
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &powershell_reader(),
+            ],
+            script,
+        )?,
+    };
+    parse_host_version(&output)
 }
 
 pub fn pairing_script(platform: HostPlatform, name: &str) -> String {
@@ -532,12 +589,24 @@ struct Slot {
     tunnel: Option<Tunnel>,
     failure: Option<(Instant, String)>,
     generation: u64,
+    // None: not checked yet; Some(None): probe failed. Retry on a new tunnel.
+    host_version: Option<Option<String>>,
 }
 
 pub struct TunnelLease {
     pub endpoint: String,
     slot: Arc<Mutex<Slot>>,
     generation: u64,
+}
+
+impl TunnelLease {
+    pub fn host_version(&self, probe: impl FnOnce() -> Option<String>) -> Option<String> {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.generation != self.generation {
+            return None;
+        }
+        slot.host_version.get_or_insert_with(probe).clone()
+    }
 }
 
 /// Each machine has its own lock: restarting one machine's tunnel (up to
@@ -550,13 +619,14 @@ impl Tunnels {
     fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Mutex<Slot>>>> {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
-    pub fn insert(&self, id: String, tunnel: Tunnel) {
+    pub fn insert(&self, id: String, tunnel: Tunnel, host_version: Option<String>) {
         // A fresh slot never waits for a reconnect in progress; that attempt's
         // tunnel is dropped with the replaced slot.
         let slot = Slot {
             tunnel: Some(tunnel),
             failure: None,
             generation: 1,
+            host_version: Some(host_version),
         };
         let old = self.slots().insert(id, Arc::new(Mutex::new(slot)));
         drop(old);
@@ -578,6 +648,7 @@ impl Tunnels {
             }
         }
         current.tunnel = None;
+        current.host_version = None;
         if let Some((when, error)) = &current.failure {
             if when.elapsed() < Duration::from_secs(10) {
                 return Err(error.clone());
@@ -660,6 +731,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launcher_version_parsing_tolerates_login_banners_but_not_multiline_garbage() {
+        assert_eq!(
+            parse_host_version("Welcome\n0.7.1\r\n"),
+            Some("0.7.1".into())
+        );
+        assert_eq!(
+            parse_host_version("0.13.0-rc.1+build.2\n"),
+            Some("0.13.0-rc.1+build.2".into())
+        );
+        assert_eq!(parse_host_version(""), None);
+        assert_eq!(parse_host_version("No such file or directory"), None);
+        assert!(version_script(HostPlatform::Unix)
+            .contains("\"$HOME/.monocode-host/bin/monocode-host\" --version"));
+        assert!(
+            version_script(HostPlatform::Windows).contains("'bin/monocode-host.cmd') --version")
+        );
+        for platform in [HostPlatform::Unix, HostPlatform::Windows] {
+            let script = version_script(platform);
+            assert!(!script.contains("service"));
+            assert!(!script.contains("install"));
+        }
+    }
+
+    #[test]
+    fn legacy_versions_are_probed_once_per_tunnel_including_failed_probes() {
+        let lease = TunnelLease {
+            endpoint: String::new(),
+            slot: Arc::new(Mutex::new(Slot::default())),
+            generation: 0,
+        };
+        assert_eq!(
+            lease.host_version(|| Some("0.7.1".into())),
+            Some("0.7.1".into())
+        );
+        assert_eq!(
+            lease.host_version(|| panic!("Already checked")),
+            Some("0.7.1".into())
+        );
+        {
+            let mut slot = lease.slot.lock().unwrap();
+            slot.generation = 1;
+            slot.host_version = None;
+        }
+        assert_eq!(lease.host_version(|| panic!("Stale connection")), None);
+        let next = TunnelLease {
+            generation: 1,
+            ..lease
+        };
+        assert_eq!(next.host_version(|| None), None);
+        assert_eq!(
+            next.host_version(|| panic!("Failed checks are cached too")),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_version_transport_uses_batch_mode_without_an_askpass_prompt() {
+        // Substitute a local shell for SSH. Never contact a real machine.
+        let target = SshTarget {
+            target: "example.invalid".into(),
+            port: None,
+            remote_port: 3774,
+        };
+        let args: Vec<_> = command(&target, false)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"BatchMode=yes".into()));
+        let mut fake_ssh = Command::new("sh");
+        fake_ssh
+            .args(["-c", "cat >/dev/null; printf 'Welcome\\n0.7.1\\n'"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let job = Job::new();
+        let output = run_remote_command(
+            &target,
+            version_script(HostPlatform::Unix),
+            &job,
+            None,
+            fake_ssh,
+            &["sh", "-l", "-s"],
+        )
+        .unwrap();
+        assert_eq!(parse_host_version(&output), Some("0.7.1".into()));
+        assert!(job.view().prompt.is_none());
+    }
+
+    #[test]
     fn stale_requests_cannot_invalidate_a_newer_tunnel() {
         let tunnels = Tunnels::default();
         let slot = |generation| {
@@ -667,6 +828,7 @@ mod tests {
                 tunnel: None,
                 failure: Some((Instant::now(), "keep".into())),
                 generation,
+                host_version: None,
             }))
         };
         let old = slot(1);
@@ -730,7 +892,7 @@ mod tests {
             &target,
             String::new(),
             &job,
-            &askpass,
+            Some(&askpass),
             make_command(),
             PLATFORM_PROBE,
         )
